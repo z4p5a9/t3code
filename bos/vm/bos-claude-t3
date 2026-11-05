@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# T3's Claude binary on a bos VM. Settles the current holder's credential with
+# bos's own helpers, as bos-ask does (bos ADR 0034, 0065), then runs claude
+# with T3's arguments. Loads no bos mods and no Remote Control.
+set -euo pipefail
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+if ! mode=$(bos-claude-auth); then
+  echo "bos-claude-t3: bos-claude-auth failed; not launching" >&2
+  exit 78
+fi
+if [ "$mode" = setup-token ]; then
+  if ! CLAUDE_CODE_OAUTH_TOKEN=$(bos-cred anthropic); then
+    echo "bos-claude-t3: could not read the setup-token; not launching" >&2
+    exit 78
+  fi
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+# bos-claude-key stops this process, and only this one, when the credential is revoked.
+export CLAUDE_CODE_API_KEY_HELPER_TTL_MS=60000
+export BOS_CLAUDE_PID=$$
+exec "$HOME/.local/bin/claude" "$@"

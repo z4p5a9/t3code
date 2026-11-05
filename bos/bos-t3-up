@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Runs a T3 Code server on a bos environment, using stock bos only.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage:
+  bos-t3-up new <project> [bos new flags...]   create an environment and run T3 on it
+  bos-t3-up install <env>                       install or repair T3 on an environment
+  bos-t3-up pair <env>                          print a one-use pairing link for the env's bos URL
+  bos-t3-up rm <env>                            delete the environment and its SSH alias
+
+T3 runs as dev, as a systemd user service on port 3773, with the pane Claude off
+(MAIN_CLAUDE=off), the way murmur runs its nodes. T3_VERSION pins the release;
+the default is the version of this Mac's T3 desktop app.
+
+The T3 desktop app reaches an environment over SSH through the alias t3-<env>,
+from ~/.ssh/bos-t3/<env>.conf. Add this line to the top of ~/.ssh/config once:
+  Include ~/.ssh/bos-t3/*.conf
+EOF
+}
+
+die() { echo "bos-t3-up: $*" >&2; exit 1; }
+
+here=$(cd "$(dirname "$0")" && pwd)
+port=3773
+bos_key="$HOME/.config/bos/ssh_key"
+conf_dir="$HOME/.ssh/bos-t3"
+
+t3_version() {
+  local desktop="$HOME/.t3/userdata/desktop-last-started-version"
+  if [ -n "${T3_VERSION:-}" ]; then
+    echo "$T3_VERSION"
+  elif [ -s "$desktop" ]; then
+    tr -d '[:space:]' < "$desktop"
+  else
+    echo latest
+  fi
+}
+
+json_field() { # json_field <key>: read one top-level string field from JSON on stdin
+  python3 -I -c 'import json, sys; v = json.load(sys.stdin).get(sys.argv[1]); print(v or "")' "$1"
+}
+
+conf() { echo "$conf_dir/$1.conf"; }
+
+vm() { # vm <env> <command...>: run as dev on the environment through IAP
+  local env=$1
+  shift
+  ssh -F "$(conf "$env")" -o BatchMode=yes -o ConnectTimeout=60 "t3-$env" "$@"
+}
+
+write_ssh_conf() { # bos's own stanza for the env, logging in as dev under the alias t3-<env>
+  local env=$1 stanza
+  stanza=$(bos ssh-config "$env" --no-grant) || die "bos ssh-config $env failed"
+  mkdir -p "$conf_dir"
+  chmod 700 "$conf_dir"
+  printf '%s\n' "$stanza" | awk -v alias="t3-$env" '
+    /^Host / { print "Host " alias; in_host = 1; next }
+    !in_host { next }
+    /^[[:space:]]+User / { print "  User dev"; next }
+    { print }' > "$(conf "$env")"
+  grep -q "^Host t3-$env\$" "$(conf "$env")" || die "could not read a Host stanza from bos ssh-config $env"
+}
+
+cmd_pair() {
+  local env=$1 out token pattern
+  [ -s "$(conf "$env")" ] || write_ssh_conf "$env"
+  out=$(vm "$env" 'export PATH="$HOME/.local/bin:$PATH"; t3 pair --ttl 15m --label bos-t3-up') \
+    || die "t3 pair failed on $env"
+  token=$(printf '%s\n' "$out" | sed -n 's/^Token: //p' | head -1)
+  [ -n "$token" ] || die "t3 pair on $env printed no token"
+  pattern=$(bos urls "$env" --json | json_field pattern)
+  [ -n "$pattern" ] || die "bos urls $env printed no URL pattern"
+  echo "Pairing link, one use, valid 15 minutes, behind your Google login:"
+  echo "  ${pattern/<port>/$port}/pair#token=$token"
+  echo "If the page asks for a token, paste: $token"
+}
+
+cmd_install() {
+  local env=$1 version
+  version=$(t3_version)
+  write_ssh_conf "$env"
+  vm "$env" true 2>/dev/null \
+    || die "dev@$env refuses $bos_key.pub. Create the environment with 'bos-t3-up new', which passes that key to bos new --authorized-key."
+  vm "$env" 'mkdir -p "$HOME/.local/bin"'
+  scp -F "$(conf "$env")" -q "$here/vm/bos-claude-t3" "t3-$env:.local/bin/bos-claude-t3"
+  vm "$env" bash -s -- "$version" "$port" < "$here/vm/install-t3.sh"
+  echo
+  echo "T3 desktop: Settings > Environments > Add environment > SSH > t3-$env"
+  if ! grep -qE '^[[:space:]]*Include[[:space:]]+~/\.ssh/bos-t3/\*\.conf' "$HOME/.ssh/config" 2>/dev/null; then
+    echo "  First add this line to the top of ~/.ssh/config: Include ~/.ssh/bos-t3/*.conf"
+  fi
+  echo "Browser or phone: bos-t3-up pair $env"
+}
+
+cmd_new() {
+  local project=$1 json env
+  shift
+  [ -r "$bos_key.pub" ] || die "no $bos_key.pub; run bos doctor"
+  # Later flags win, so a caller can override --idle-timeout. A repeated --set key is bos's loud error.
+  json=$(bos new "$project" --json --set MAIN_CLAUDE=off --idle-timeout 0 \
+    --authorized-key "$(cat "$bos_key.pub")" "$@") \
+    || { printf '%s\n' "$json" >&2; die "bos new $project failed"; }
+  env=$(printf '%s' "$json" | json_field name)
+  [ -n "$env" ] || die "bos new returned no environment name: $json"
+  echo "Created $env."
+  cmd_install "$env"
+  echo
+  cmd_pair "$env"
+}
+
+cmd_rm() {
+  local env=$1
+  bos rm --yes "$env"
+  rm -f "$(conf "$env")"
+  echo "Removed $env and t3-$env. Remove it from T3 desktop in Settings > Environments."
+}
+
+case "${1:-}" in
+  new) [ $# -ge 2 ] || { usage >&2; exit 2; }; shift; cmd_new "$@" ;;
+  rm) [ $# -eq 2 ] || { usage >&2; exit 2; }; cmd_rm "$2" ;;
+  install) [ $# -eq 2 ] || { usage >&2; exit 2; }; cmd_install "$2" ;;
+  pair) [ $# -eq 2 ] || { usage >&2; exit 2; }; cmd_pair "$2" ;;
+  -h | --help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
